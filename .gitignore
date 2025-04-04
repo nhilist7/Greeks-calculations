@@ -1,174 +1,227 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+import pandas as pd
+import numpy as np
+from datetime import datetime, time as t, timedelta
+from kiteconnect import KiteConnect
+from scipy.stats import norm
+from scipy.optimize import brentq
+from math import log, sqrt, exp
+import logging
+import time
+import warnings
 
-# C extensions
-*.so
+warnings.filterwarnings("ignore")
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
+EXPIRY = '2025-02-13'  
+EXPIRY_DT = datetime(2025, 2, 13, 15, 30, 0)
+TRADING_START = t(9, 15)
+TRADING_END = t(15, 30)
+RISK_FREE_RATE = 0.068
+DIVIDEND_YIELD = 0.012
+TODAY = datetime.now().strftime('%Y-%m-%d')
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+instruments = pd.DataFrame(kite.instruments())
+nifty_instrument = instruments[
+    (instruments['exchange'] == 'NSE') & 
+    (instruments['name'] == 'NIFTY 50') & 
+    (instruments['segment'] == 'INDICES')
+].iloc[0]
+underlying_inst_id = nifty_instrument['instrument_token']
 
-# Flask stuff:
-instance/
-.webassets-cache
+# Get NIFTY opening price at 9:15
+nifty_data = kite.historical_data(
+    instrument_token=underlying_inst_id, 
+    from_date=TODAY, 
+    to_date=TODAY, 
+    interval="day"
+)
+open_price = nifty_data[0]['open']
 
-# Scrapy stuff:
-.scrapy
+# Black-Scholes Greeks formulae
 
-# Sphinx documentation
-docs/_build/
+def d1(S, K, T, r, q, sigma):
+    """Calculate d1 for Black-Scholes."""
+    return (log(S / K) + (r - q + sigma**2 / 2) * T) / (sigma * sqrt(T))
 
-# PyBuilder
-.pybuilder/
-target/
+def d2(S, K, T, r, q, sigma):
+    """Calculate d2 for Black-Scholes."""
+    return d1(S, K, T, r, q, sigma) - sigma * sqrt(T)
 
-# Jupyter Notebook
-.ipynb_checkpoints
+def nd1(S, K, T, r, q, sigma):
+    """Calculate N'(d1) - normal probability density function."""
+    return norm.pdf(d1(S, K, T, r, q, sigma))
 
-# IPython
-profile_default/
-ipython_config.py
+def Nd1(S, K, T, r, q, sigma):
+    """Calculate N(d1) - cumulative distribution function."""
+    return norm.cdf(d1(S, K, T, r, q, sigma))
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+def Nd2(S, K, T, r, q, sigma):
+    """Calculate N(d2) - cumulative distribution function."""
+    return norm.cdf(d2(S, K, T, r, q, sigma))
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+# Separate Greek Functions
+def calculate_delta(S, K, T, r, q, sigma, option_type):
+    """Calculate Delta for the option."""
+    if option_type == 'call':
+        return exp(-q * T) * Nd1(S, K, T, r, q, sigma)
+    elif option_type == 'put':
+        return exp(-q * T) * (Nd1(S, K, T, r, q, sigma) - 1)
+    else:
+        raise ValueError("Invalid option type. Use 'call' or 'put'.")
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+def calculate_theta(S, K, T, r, q, sigma, option_type):
+    """Calculate Theta for the option (per day)."""
+    d1_val = d1(S, K, T, r, q, sigma)
+    d2_val = d2(S, K, T, r, q, sigma)
+    nd1_val = nd1(S, K, T, r, q, sigma)
+    Nd1_val = Nd1(S, K, T, r, q, sigma)
+    Nd2_val = Nd2(S, K, T, r, q, sigma)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+    if option_type == 'call':
+        theta = (-S * exp(-q * T) * nd1_val * sigma / (2 * sqrt(T)) - 
+                 r * K * exp(-r * T) * Nd2_val + 
+                 q * S * exp(-q * T) * Nd1_val) / 365
+    elif option_type == 'put':
+        theta = (-S * exp(-q * T) * nd1_val * sigma / (2 * sqrt(T)) + 
+                 r * K * exp(-r * T) * (1 - Nd2_val) - 
+                 q * S * exp(-q * T) * (1 - Nd1_val)) / 365
+    else:
+        raise ValueError("Invalid option type. Use 'call' or 'put'.")
+    return theta
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+def calculate_vega(S, K, T, r, q, sigma):
+    """Calculate Vega for the option (per 1% change in volatility)."""
+    return S * exp(-q * T) * nd1(S, K, T, r, q, sigma) * sqrt(T) * 0.01
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+def calculate_gamma(S, K, T, r, q, sigma):
+    """Calculate Gamma for the option."""
+    return exp(-q * T) * nd1(S, K, T, r, q, sigma) / (S * sigma * sqrt(T))
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+def calculate_vomma(S, K, T, r, q, sigma):
+    """Calculate Vomma for the option."""
+    d1_val = d1(S, K, T, r, q, sigma)
+    d2_val = d2(S, K, T, r, q, sigma)
+    vega = calculate_vega(S, K, T, r, q, sigma)
+    return vega * d1_val * (d2_val / sigma)
 
-# SageMath parsed files
-*.sage.py
+# Black-Scholes Price and IV Calculation
+def black_scholes_price(S, K, T, r, q, sigma, option_type):
+    """Calculate Black-Scholes option price."""
+    d1_val = d1(S, K, T, r, q, sigma)
+    d2_val = d2(S, K, T, r, q, sigma)
+    if option_type == 'call':
+        return S * exp(-q * T) * norm.cdf(d1_val) - K * exp(-r * T) * norm.cdf(d2_val)
+    elif option_type == 'put':
+        return K * exp(-r * T) * norm.cdf(-d2_val) - S * exp(-q * T) * norm.cdf(-d1_val)
+    else:
+        raise ValueError("Invalid option type. Use 'call' or 'put'.")
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+def calculate_iv(option_price, S, K, T, r, q, option_type):
+    """Calculate implied volatility using Brent's method."""
+    option_func = lambda sigma: black_scholes_price(S, K, T, r, q, sigma, option_type) - option_price
+    try:
+        iv = brentq(option_func, 0.01, 2.0)
+        return iv
+    except ValueError:
+        return None
 
-# Spyder project settings
-.spyderproject
-.spyproject
 
-# Rope project settings
-.ropeproject
+def main():
+    strike_range = [-450, -400, -350, -300, -250, -200, -150, -100, -50, 
+                    0, 50, 100, 150, 200, 250, 300, 350, 400, 450]
 
-# mkdocs documentation
-/site
+    ce_tokens = {}
+    pe_tokens = {}
+    for strike_offset in strike_range:
+        ce_instrum = instruments[
+            (instruments['exchange'] == 'NFO') & 
+            (instruments['name'] == 'NIFTY') & 
+            (instruments['instrument_type'] == 'CE') & 
+            (instruments['expiry'] == EXPIRY)
+        ]
+        pe_instrum = instruments[
+            (instruments['exchange'] == 'NFO') & 
+            (instruments['name'] == 'NIFTY') & 
+            (instruments['instrument_type'] == 'PE') & 
+            (instruments['expiry'] == EXPIRY)
+        ]
+        for strike in ce_instrum['strike'].unique():
+            ce_tokens[strike] = int(ce_instrum[ce_instrum['strike'] == strike].iloc[0]['instrument_token'])
+        for strike in pe_instrum['strike'].unique():
+            pe_tokens[strike] = int(pe_instrum[pe_instrum['strike'] == strike].iloc[0]['instrument_token'])
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    while True:
+        now = datetime.now()
+        current_time = t(now.hour, now.minute)
+        if TRADING_START <= current_time <= TRADING_END and now.second == 0:
+            try:
+                # Fetch underlying price
+                underlying_data = kite.historical_data(
+                    instrument_token=underlying_inst_id, 
+                    from_date=TODAY, 
+                    to_date=now, 
+                    interval="minute"
+                )
+                underlying_price = pd.DataFrame(underlying_data).iloc[-1]['close']
+                atm_live = round(underlying_price / 50) * 50
+                year_to_expiry = (EXPIRY_DT - now).total_seconds() / (365 * 24 * 60 * 60)
 
-# Pyre type checker
-.pyre/
+                # Calculate Greeks for CE and PE
+                for strike_offset in strike_range:
+                    strike = atm_live + strike_offset
 
-# pytype static type analyzer
-.pytype/
+                    # Call Option
+                    if strike in ce_tokens:
+                        ce_token = ce_tokens[strike]
+                        ce_data = kite.historical_data(
+                            instrument_token=ce_token, 
+                            from_date=TODAY, 
+                            to_date=now, 
+                            interval="minute"
+                        )
+                        premium = pd.DataFrame(ce_data).iloc[-1]['close']
+                        iv = calculate_iv(premium, underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, 'call')
+                        if iv:
+                            delta = calculate_delta(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv, 'call')
+                            theta = calculate_theta(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv, 'call')
+                            vega = calculate_vega(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            gamma = calculate_gamma(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            vomma = calculate_vomma(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            logging.info(f"{now} - Strike {strike} CE: Delta={delta:.4f}, Theta={theta:.4f}, "
+                                         f"Vega={vega:.4f}, Gamma={gamma:.4f}, Vomma={vomma:.4f}")
 
-# Cython debug symbols
-cython_debug/
+                    # Put Option
+                    if strike in pe_tokens:
+                        pe_token = pe_tokens[strike]
+                        pe_data = kite.historical_data(
+                            instrument_token=pe_token, 
+                            from_date=TODAY, 
+                            to_date=now, 
+                            interval="minute"
+                        )
+                        premium = pd.DataFrame(pe_data).iloc[-1]['close']
+                        iv = calculate_iv(premium, underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, 'put')
+                        if iv:
+                            delta = calculate_delta(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv, 'put')
+                            theta = calculate_theta(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv, 'put')
+                            vega = calculate_vega(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            gamma = calculate_gamma(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            vomma = calculate_vomma(underlying_price, strike, year_to_expiry, RISK_FREE_RATE, DIVIDEND_YIELD, iv)
+                            logging.info(f"{now} - Strike {strike} PE: Delta={delta:.4f}, Theta={theta:.4f}, "
+                                         f"Vega={vega:.4f}, Gamma={gamma:.4f}, Vomma={vomma:.4f}")
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+            except Exception as e:
+                logging.error(f"Error in main loop: {str(e)}")
 
-# Ruff stuff:
-.ruff_cache/
+        time.sleep(0.1)
 
-# PyPI configuration file
-.pypirc
+if __name__ == "__main__":
+    main()
